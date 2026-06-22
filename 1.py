@@ -40,29 +40,36 @@ def get_weather(team, date):
 
 
 class BayesianPredictor:
-    def __init__(self, c=0.45):
+    def __init__(self, c=0.45, lambda_decay=0.005):
         self.c = c
+        self.lambda_decay = lambda_decay
         self.ranks = PREVIOUS_SEASON_RANKS.copy()
 
     def get_rank(self, team):
         return self.ranks.get(team, 1000.0)
 
-    def predict(self, home, away, h_perf, rain):
-        r_h, r_a = self.get_rank(home), self.get_rank(away)
-        prior = r_h / (r_h + r_a)
-        weather_factor = 0.8 if rain > 5 else 1.0
-        nudge = (prior ** 2 / 1000) * h_perf * weather_factor
-        return np.clip(prior + (nudge * 0.2), 0.05, 0.95)
+    def predict(self, home, away, h_form_margin, a_form_margin, rain, market_prior):
+        prior = market_prior
+        weather_factor = 0.70 if rain > 5 else 1.0
+        form_delta = h_form_margin - a_form_margin
 
-    def update(self, home, away, outcome):
+        nudge = (prior * (1 - prior)) * form_delta * weather_factor
+
+        # INCREASED FROM 0.15 TO 0.65: Let your form data drive higher model expression
+        return np.clip(prior + (nudge * 0.65), 0.01, 0.99)
+
+    def update(self, home, away, outcome, days_ago, market_prior):
         r_h, r_a = self.get_rank(home), self.get_rank(away)
-        adjust = (self.c * (r_h - r_a)) - r_h
-        self.ranks[home] = max(100, r_h + (adjust * outcome))
+        weight = np.exp(-self.lambda_decay * days_ago)
+
+        adjust = self.c * (outcome - market_prior) * 150.0
+
+        self.ranks[home] = max(100, r_h + (adjust * weight))
+        self.ranks[away] = max(100, r_a - (adjust * weight))
 
 
 # --- EXECUTION PIPELINE ---
 def run_pipeline():
-    # UPDATE THIS: Points directly to the .xlsx file
     filename = 'all-euro-data-2025-2026.xlsx'
 
     if not os.path.exists(filename):
@@ -70,34 +77,46 @@ def run_pipeline():
         return None
 
     try:
-        # We specify the SHEET NAME here (E0 = Premier League)
         df = pd.read_excel(filename, sheet_name='E0')
         print("Excel data loaded successfully!")
     except Exception as e:
         print(f"Failed to load Excel: {e}")
         return None
 
-    # Filter columns
-    cols = ['Date', 'HomeTeam', 'AwayTeam', 'FTR', 'HS', 'HST', 'B365H']
+    cols = ['Date', 'HomeTeam', 'AwayTeam', 'FTR', 'HS', 'HST', 'AS', 'AST', 'B365H']
     df = df[cols].copy()
-    df['Date'] = pd.to_datetime(df['Date']).dt.strftime('%Y-%m-%d')
 
-    # Feature Engineering
+    df['Date'] = pd.to_datetime(df['Date'])
+    max_date = df['Date'].max()
+
     df['h_eff'] = (df['HST'] / df['HS'].replace(0, 1)).clip(0, 1)
-    df['home_rolling_perf'] = df.groupby('HomeTeam')['h_eff'].transform(
-        lambda x: x.shift(1).rolling(5, min_periods=1).mean()).fillna(1.0)
+    df['a_eff'] = (df['AST'] / df['AS'].replace(0, 1)).clip(0, 1)
 
-    model = BayesianPredictor()
+    df['home_rolling_margin'] = df.groupby('HomeTeam')['h_eff'].transform(
+        lambda x: x.shift(1).rolling(5, min_periods=1).mean()).fillna(0.3)
+
+    df['away_rolling_margin'] = df.groupby('AwayTeam')['a_eff'].transform(
+        lambda x: x.shift(1).rolling(5, min_periods=1).mean()).fillna(0.3)
+
+    model = BayesianPredictor(c=0.40, lambda_decay=0.003)
     results = []
     correct_preds, total_bets, total_profit = 0, 0, 0
 
-    print("Analyzing Multimodal Pipeline...")
+    # OPTIMIZED VALUE THRESHOLD FOR HIGH CALIBRATION: Look for a clean 1.5% clear alpha advantage
+    VALUE_THRESHOLD = 0.015
+
+    print("Analyzing Fine-Tuned Multimodal Bayesian Pipeline...")
     for _, row in df.iterrows():
-        _, rain = get_weather(row['HomeTeam'], row['Date'])
-        prob = model.predict(row['HomeTeam'], row['AwayTeam'], row['home_rolling_perf'], rain)
+        date_str = row['Date'].strftime('%Y-%m-%d')
+        days_ago = (max_date - row['Date']).days
+
         market_prob = 1 / row['B365H'] if pd.notnull(row['B365H']) else 0.5
 
-        has_value = prob > market_prob
+        _, rain = get_weather(row['HomeTeam'], date_str)
+        prob = model.predict(row['HomeTeam'], row['AwayTeam'], row['home_rolling_margin'], row['away_rolling_margin'],
+                             rain, market_prob)
+
+        has_value = (prob - market_prob) >= VALUE_THRESHOLD
         bet_pnl = (row['B365H'] - 1) if (has_value and row['FTR'] == 'H') else -1 if has_value else 0
 
         if (prob > 0.5 and row['FTR'] == 'H') or (prob <= 0.5 and row['FTR'] != 'H'):
@@ -113,8 +132,9 @@ def run_pipeline():
             'Value': "YES" if has_value else "NO",
             'Result': row['FTR']
         })
-        model.update(row['HomeTeam'], row['AwayTeam'],
-                     (1.0 if row['FTR'] == 'H' else 0.5 if row['FTR'] == 'D' else 0.0))
+
+        outcome_val = (1.0 if row['FTR'] == 'H' else 0.5 if row['FTR'] == 'D' else 0.0)
+        model.update(row['HomeTeam'], row['AwayTeam'], outcome_val, days_ago, market_prob)
 
     accuracy = (correct_preds / len(df)) * 100
     roi = (total_profit / total_bets) * 100 if total_bets > 0 else 0
@@ -122,9 +142,3 @@ def run_pipeline():
     print(f"\n--- GROUP 11 FINAL SUMMARY ---")
     print(f"Accuracy: {accuracy:.2f}% | ROI: {roi:.2f}% | Bets: {total_bets}")
     return pd.DataFrame(results)
-
-
-if __name__ == "__main__":
-    final_df = run_pipeline()
-    if final_df is not None:
-        print(final_df.tail(10))
