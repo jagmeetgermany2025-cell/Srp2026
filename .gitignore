@@ -1,0 +1,14 @@
+# Environments
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Generated analysis outputs — rerun `python run.py` to regenerate
+eda_part1.txt
+eda_part2.txt
+eda_part3.txt
+eda_figures.png
+
+# OS noise
+.DS_Store
