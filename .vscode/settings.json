@@ -1,0 +1,7 @@
+{
+  // No absolute interpreter path here on purpose — that would only be valid on
+  // one machine. VS Code auto-detects a .venv/ in the workspace root; `python
+  // run.py` creates one if the machine has no suitable interpreter already.
+  "python.terminal.activateEnvironment": true,
+  "python.analysis.extraPaths": ["."]
+}
