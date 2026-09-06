@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+data/raw/
+catboost_info/
+.DS_Store
