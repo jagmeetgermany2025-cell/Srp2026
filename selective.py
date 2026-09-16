@@ -35,14 +35,12 @@ code and read the output.
 
 ON n.pdf
 
-n.pdf proposes five extensions. Two are used: extra market and on-pitch
-features, and a two-stage model. One is used in weakened form: its staking
-question, without the learning agent. Two are rejected: the end-to-end
-network and the tabular foundation models.
-
-The reason for rejecting them is structural, not stylistic. Both dissolve the
-separable selection step, and a model with no selection step has no selection
-bias to correct. They do not simplify the project; they delete its subject.
+n.pdf proposes five extensions. This script uses extra market and on-pitch
+features, a two-stage model, and fixed staking rules. The separate run_tfm.py
+experiment compares TabPFN, TabNet and FT-Transformer with LightGBM while
+preserving calibration, shrinkage and selection. Changing the probability
+estimator does not require removing the separable selection step. See
+README_TFM.md for the chronological comparison protocol.
 
 ORDER OF OPERATIONS -- do not vary:
 
@@ -71,11 +69,12 @@ from sklearn.model_selection import cross_val_predict
 try:
     import lightgbm as lgb
     HAVE_LGB = True
-except ImportError:                                          # pragma: no cover
+except (ImportError, OSError):                               # pragma: no cover
     from sklearn.ensemble import HistGradientBoostingClassifier
     from sklearn.ensemble import HistGradientBoostingRegressor
     HAVE_LGB = False
-    warnings.warn("lightgbm not installed; using sklearn HistGradientBoosting.")
+    warnings.warn("lightgbm unavailable; legacy factories use sklearn HistGradientBoosting. "
+                  "The TFM runner requires the explicitly requested model and never substitutes it.")
 
 
 # =========================================================================
