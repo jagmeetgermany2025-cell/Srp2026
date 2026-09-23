@@ -1,0 +1,18 @@
+# Secrets — never
+.api_football_key
+
+# Third-party data. football-data.co.uk, Understat and API-Football all
+# restrict redistribution, and this repository is public, so their files stay
+# local. Everything here is re-downloaded by fetch/ and rebuilt by build/.
+data/
+
+# LaTeX build products
+doc/*.aux
+doc/*.log
+doc/*.out
+doc/*.png
+doc/build.log
+
+# Python
+__pycache__/
+*.pyc
