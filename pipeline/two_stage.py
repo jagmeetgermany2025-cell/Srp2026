@@ -438,6 +438,15 @@ def add_league_context(df: pd.DataFrame) -> pd.DataFrame:
         lambda x: x.shift(1).rolling(20, min_periods=5).mean()))
     out["league_home_rate_20"] = (home_win.groupby(out["Div"]).transform(
         lambda x: x.shift(1).rolling(20, min_periods=5).mean()))
+    # SAME-DAY MATCHES MUST NOT SEE EACH OTHER. Shifting by one row only keeps
+    # a match from seeing itself; a match later in the same day's sort order
+    # would still see the result of one kicking off alongside it. Every match
+    # on a date takes the value of that date's first row, which saw only
+    # earlier days.
+    for col in ("league_goals_20", "league_home_rate_20"):
+        # iloc[0], not "first": "first" skips nulls, and would hand an early
+        # match with no value the value of a later one.
+        out[col] = out.groupby(["Div", "Date"])[col].transform(lambda x: x.iloc[0])
     if "Tier" not in out.columns:
         out["Tier"] = out["Div"].map(lambda d: TIERS.get(d, ("?", 0))[1])
 
@@ -546,7 +555,13 @@ def load_and_prepare(export_csv: str = "all-euro-data-2025-2026.csv",
     print(f"Loaded {len(df):,} matches, {df['Div'].nunique()} divisions, "
           f"{df['Date'].min().date()} to {df['Date'].max().date()}")
 
-    return add_shot_features(add_market_features(calculate_rolling_features(df)))
+    # THE SAME FEATURE BUILD AS load_multiseason(). This used to stop at the
+    # shot features, so an export run trained stage 1 on 26 of the 66
+    # STAGE1_FEATURES -- no Elo, no previous season, no xG proxy, no league
+    # context -- and said nothing, because the only warning about missing
+    # blocks lives in attach_external_features(), which never ran.
+    built = add_shot_features(add_market_features(calculate_rolling_features(df)))
+    return attach_external_features(add_league_context(built))
 
 
 def load_multiseason(path: str = "matches_all.csv",
@@ -2404,7 +2419,8 @@ def check_non_vacuousness(preds_df: pd.DataFrame,
                           corrected_prefix: str = "p_corr",
                           raw_prefix: str = "p_indep",
                           taus: np.ndarray = None,
-                          n_boot: int = 1000) -> pd.DataFrame:
+                          n_boot: int = 1000,
+                          criterion: str = None) -> pd.DataFrame:
     """
     Test whether the correction is real or just a relabelled threshold.
 
@@ -2423,13 +2439,20 @@ def check_non_vacuousness(preds_df: pd.DataFrame,
     well below one means the correction REORDERS which matches look attractive,
     and no change of threshold can do that.
     """
+    # ON THE SAME CRITERION AS THE CLAIM. This used to rank by expected value
+    # while the operating point and the headline rank by edge, so the gate was
+    # testing a different selection rule from the one being reported.
+    criterion = criterion or OP_CRITERION
+    if not rankable(preds_df, corrected_prefix, criterion):
+        return pd.DataFrame()          # collapsed onto the market: nothing to test
     if taus is None:
-        taus = np.quantile(score_pool(preds_df, corrected_prefix),
+        taus = np.quantile(score_pool(preds_df, corrected_prefix,
+                                      criterion=criterion),
                            np.linspace(0.60, 0.99, 12))
 
     rows = []
     for tau in taus:
-        bets_c = select_bets(preds_df, tau, corrected_prefix)
+        bets_c = select_bets(preds_df, tau, corrected_prefix, criterion=criterion)
         n_target = len(bets_c)
         if n_target < 20:
             continue
@@ -2439,12 +2462,13 @@ def check_non_vacuousness(preds_df: pd.DataFrame,
         lo, hi = -1.0, 5.0
         for _ in range(40):
             mid = (lo + hi) / 2
-            if len(select_bets(preds_df, mid, raw_prefix)) > n_target:
+            if len(select_bets(preds_df, mid, raw_prefix,
+                               criterion=criterion)) > n_target:
                 lo = mid
             else:
                 hi = mid
         tau_prime = (lo + hi) / 2
-        bets_r = select_bets(preds_df, tau_prime, raw_prefix)
+        bets_r = select_bets(preds_df, tau_prime, raw_prefix, criterion=criterion)
 
         id_c = set(zip(bets_c["match_key"], bets_c["Selection"]))
         id_r = set(zip(bets_r["match_key"], bets_r["Selection"]))
@@ -2482,6 +2506,15 @@ def era_breakdown(preds_df: pd.DataFrame, folds_df: pd.DataFrame,
         unit_col = "Block" if "Block" in preds_df.columns else "Season"
 
     criterion = criterion or OP_CRITERION
+    # An arm collapsed onto the market has no edge to rank, and its "top 10%"
+    # is a sort of rounding residue. Same rule as the operating point.
+    if not rankable(preds_df, prob_prefix, criterion):
+        return pd.DataFrame()
+    # Where the fold diagnostics carry a threshold read off VALIDATION for this
+    # arm, use it, so a test unit's own scores never choose its bets.
+    tau_col = {"p_corr": "op_tau", "p_indep": "op_tau_indep"}.get(prob_prefix)
+    if criterion != OP_CRITERION or tau_col not in folds_df.columns:
+        tau_col = None
     rows = []
     for unit, part in preds_df.groupby(preds_df[unit_col]):
         # BY COVERAGE, AND ON THE SAME CRITERION AS EVERYTHING ELSE. This was
@@ -2489,8 +2522,11 @@ def era_breakdown(preds_df: pd.DataFrame, folds_df: pd.DataFrame,
         # units: under edge ranking it selected nothing useful, and when the
         # weight collapses to zero it scored the market's own picks -- so two
         # different models printed byte-identical rows here.
-        tau = float(np.quantile(score_pool(part, prob_prefix, criterion=criterion),
-                                1.0 - coverage))
+        fold_tau = (folds_df.loc[folds_df["test_unit"] == unit, tau_col]
+                    if tau_col else pd.Series(dtype=float))
+        tau = (float(fold_tau.iloc[0]) if len(fold_tau) else
+               float(np.quantile(score_pool(part, prob_prefix, criterion=criterion),
+                                 1.0 - coverage)))
         bets = select_bets(part, tau, prob_prefix, criterion=criterion)
         b = bootstrap_roi(bets, n_boot=2000)
         w = folds_df.loc[folds_df["test_unit"] == unit, "w"]
@@ -2663,6 +2699,12 @@ def fit_fold(fold, seed: int = 42, stage2_target: str = "probability",
     va_scored = window.copy()
     va_scored[outcome_cols("p_corr")] = apply_static_shrinkage(
         fit_ref, fit_model, w)
+    # The uncorrected arm gets a threshold of its own. If the weight collapses,
+    # the corrected arm cannot rank anything and the report falls back to this
+    # one -- a threshold read off the corrected arm would then be a quantile of
+    # rounding error, and applying it to real edges would select almost
+    # everything.
+    va_scored[outcome_cols("p_indep")] = fit_model
 
     # The operating point's threshold is read off VALIDATION scores, so the test
     # unit's own score distribution never decides which of its bets are placed.
@@ -2673,6 +2715,9 @@ def fit_fold(fold, seed: int = 42, stage2_target: str = "probability",
     # that. Both thresholds are reported; this is the one the claim rests on.
     op_tau = float(np.quantile(
         score_pool(va_scored, "p_corr", criterion=OP_CRITERION),
+        1.0 - op_coverage))
+    op_tau_indep = float(np.quantile(
+        score_pool(va_scored, "p_indep", criterion=OP_CRITERION),
         1.0 - op_coverage))
 
     stake_model = None
@@ -2701,7 +2746,7 @@ def fit_fold(fold, seed: int = 42, stage2_target: str = "probability",
     diagnostics = {
         "test_unit": fold.test_unit, "val_unit": fold.val_unit,
         "n_train": len(tr), "n_val": len(va), "n_test": len(te),
-        "w": w, "w_band": w_band, "c_js": c_js,
+        "w": w, "w_band": w_band, "c_js": c_js, "op_tau_indep": op_tau_indep,
         "rho": engine.rho, "n_rho_div": len(engine.rho_by_div), "op_tau": op_tau,
         "uncertainty_corr": corr, "uncertainty_corr_in": corr_in,
         **{f"ll_{name}": log_loss(y_test, p, labels=[0, 1, 2])
@@ -2895,12 +2940,30 @@ def main(source: str = "raw/all-euro-data-2025-2026.csv", mode: str = "export",
     # Each test unit is thresholded at the tau its own validation unit gave,
     # so no test score helps decide which test bets are placed.
     unit_col = "Block" if "Block" in preds.columns else "Season"
+
+    # WHICH ARM THE OPERATING POINT RUNS ON. When the weight collapses to zero
+    # the corrected arm IS the market, its edge is zero on every match, and the
+    # only thing left to rank is floating-point residue from renormalising the
+    # blend -- around 2e-07. Sorting that and taking the top 10% picks matches
+    # at random while looking exactly like a strategy, and the resulting ROI
+    # reads as a result. It is not one. So the operating point runs on the
+    # corrected arm only while that arm still differs from the market, and
+    # falls back to the uncorrected one, which always has opinions of its own.
+    op_prefix = "p_corr" if rankable(preds, "p_corr", OP_CRITERION) else "p_indep"
+    if op_prefix != "p_corr":
+        print("\n  NOTE: the corrected arm has collapsed onto the market, so it "
+              "cannot\n  rank anything -- its edge is zero on every match. The "
+              "operating point\n  below is the UNCORRECTED arm, which still "
+              "selects on its own opinion.")
+
+    tau_col = "op_tau" if op_prefix == "p_corr" else "op_tau_indep"
     op_bets = pd.concat(
-        [select_bets(preds[preds[unit_col] == unit], tau, "p_corr",
+        [select_bets(preds[preds[unit_col] == unit], tau, op_prefix,
                      criterion=OP_CRITERION)
-         for unit, tau in zip(folds["test_unit"], folds["op_tau"])],
+         for unit, tau in zip(folds["test_unit"], folds[tau_col])],
         ignore_index=True)
-    report_roi(op_bets, f"Operating point: corrected, top 10% by "
+    op_label = "corrected" if op_prefix == "p_corr" else "uncorrected"
+    report_roi(op_bets, f"Operating point: {op_label}, top 10% by "
                         f"{OP_CRITERION.upper()} on the training window "
                         f"(per-fold tau in the diagnostics)")
 
@@ -2931,14 +2994,20 @@ def main(source: str = "raw/all-euro-data-2025-2026.csv", mode: str = "export",
             show(f"Risk-coverage by {criterion}, {label}:  "
                  f"AURC = {aurc(curve):+.3f}", curve)
 
-    nv = show("Non-vacuousness check:",
-              check_non_vacuousness(preds, "p_corr", "p_indep"))
+    nv = check_non_vacuousness(preds, "p_corr", "p_indep")
+    if len(nv):
+        show(f"Non-vacuousness check (ranked by {OP_CRITERION}):", nv)
+    else:
+        print(f"\nNon-vacuousness check: skipped. The corrected arm has no "
+              f"{OP_CRITERION} to rank on\n  -- it collapsed onto the market -- "
+              "so there is no corrected selection to compare.")
     if len(nv) and nv["overlap"].mean() > 0.95:
         print("\n  WARNING: the corrected and uncorrected rules are selecting "
               "almost the same bets.\n  The correction may be a relabelled "
               "threshold rather than a correction.")
 
-    show(f"By {unit_col.lower()}:", era_breakdown(preds, folds))
+    show(f"By {unit_col.lower()} ({op_label} arm, validation tau):",
+         era_breakdown(preds, folds, prob_prefix=op_prefix, unit_col=unit_col))
 
     if export:
         keep = ["match_key", "Date", "Season", "Div", "Tier", "target"]

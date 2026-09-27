@@ -103,7 +103,7 @@ def report(df: pd.DataFrame, name: str, features: list | None) -> None:
 
 
 def main() -> None:
-    df = pd.read_csv("dataset_2526.csv", low_memory=False)
+    df = pd.read_csv(DATA / "dataset_2526.csv", low_memory=False)
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
     df = df[df["FTR"].isin(TARGET)].copy()
     df["y"] = df["FTR"].map(TARGET)

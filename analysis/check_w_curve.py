@@ -29,7 +29,8 @@ import pandas as pd
 from sklearn.metrics import log_loss
 
 from two_stage import (MatchEngine, apply_static_shrinkage, load_multiseason,
-                       make_folds, outcome_cols, probs, selection_band,
+                       make_folds, outcome_cols, probs, rankable, score_pool,
+                       select_bets, selection_band, OP_CRITERION,
                        STAGE1_FEATURES, STAGE1_REQUIRED)
 
 GRID = np.round(np.arange(0.0, 1.01, 0.1), 2)
@@ -37,18 +38,27 @@ COVERAGE = 0.10
 
 
 def roi_of(sub: pd.DataFrame, p: np.ndarray, coverage: float) -> tuple:
-    """Flat-stake ROI of the top `coverage` bets ranked by expected value."""
-    odds = sub[outcome_cols("odds_best")].to_numpy(dtype=float)
-    ev = p * odds - 1.0
-    best = ev.argmax(axis=1)
-    rows = np.arange(len(sub))
-    edge = ev[rows, best]
-    keep = edge >= np.quantile(edge, 1.0 - coverage)
-    y = sub["target"].astype(int).to_numpy()
-    won = (best == y)[keep]
-    paid = odds[rows, best][keep]
-    profit = np.where(won, paid - 1.0, -1.0)
-    return float(profit.mean() * 100), int(keep.sum()), float(edge[keep].mean() * 100)
+    """
+    Flat-stake ROI of the top `coverage` bets, chosen by the PIPELINE'S rule.
+
+    This used to rank by expected value over all three outcomes, draws
+    included, while the pipeline ranks home and away bets by edge. A curve
+    drawn with a different rule says nothing about the pipeline's, so this
+    now calls the pipeline's own selection. At w = 0 the blend is the market,
+    there is no edge to rank, and the row is left blank rather than filled
+    with a sort of rounding residue.
+    """
+    frame = sub.copy()
+    frame[outcome_cols("p_corr")] = p
+    if not rankable(frame, "p_corr", OP_CRITERION):
+        return np.nan, 0, np.nan
+    tau = float(np.quantile(score_pool(frame, "p_corr", criterion=OP_CRITERION),
+                            1.0 - coverage))
+    bets = select_bets(frame, tau, "p_corr", criterion=OP_CRITERION)
+    if bets.empty:
+        return np.nan, 0, np.nan
+    roi = float(bets["PnL"].sum() / bets["Stake"].sum() * 100)
+    return roi, len(bets), float(bets["Score"].mean() * 100)
 
 
 def main() -> None:
@@ -59,9 +69,13 @@ def main() -> None:
     print(f"\nfold: train {len(tr):,}  val {va['Season'].iat[0]} ({len(va):,})  "
           f"test {fold.test_unit} ({len(te):,})")
 
+    # rho from out-of-fold predictions on the training seasons, as the pipeline
+    # does. Fitting it on the validation season and then predicting that same
+    # season, as this used to, scored the draw correction in-sample.
     engine = MatchEngine(seed=42)
     oof = engine.fit_predict_oof(tr)
-    engine.fit(tr, va)
+    engine.fit(tr)
+    engine.fit_rho(oof, tr)
     p_model = np.vstack([engine.probs_from_physical(oof, tr),
                          engine.predict_proba(va)])
     p_ref = np.vstack([probs(tr, "p_ref"), probs(va, "p_ref")])
@@ -69,9 +83,11 @@ def main() -> None:
     pool = pd.concat([tr, va], ignore_index=True)
 
     band = selection_band(p_ref, p_model, COVERAGE)
-    print(f"band: {band.sum():,} of {len(band):,} matches\n")
+    print(f"band: {band.sum():,} of {len(band):,} matches")
+    print("Scored on the fitting window (train out-of-fold + validation), not "
+          "the test season.\n")
     print(f"{'w':>5}  {'log loss all':>12}  {'log loss band':>13}  "
-          f"{'ROI band %':>10}  {'bets':>6}  {'expected %':>10}")
+          f"{'ROI top10 %':>10}  {'bets':>6}  {'edge %':>10}")
     for w in GRID:
         blend = apply_static_shrinkage(p_ref, p_model, w)
         ll_all = log_loss(y, blend, labels=[0, 1, 2])

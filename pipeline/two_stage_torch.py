@@ -45,7 +45,7 @@ from sklearn.metrics import log_loss
 from sklearn.model_selection import cross_val_predict
 
 import torch
-from sklearn.base import BaseEstimator, RegressorMixin
+from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.ensemble import HistGradientBoostingRegressor
 from torch import nn
@@ -61,6 +61,44 @@ TORCH_PATIENCE = 12
 TORCH_BATCH = 512
 TORCH_LR = 3e-3
 TORCH_VAL_SHARE = 0.15
+
+# --- which learner each stage uses, and how many copies it averages --------
+# Set through configure(), never by editing these. The defaults reproduce the
+# pipeline exactly as it was: the MLP in stage 1, sklearn's boosting in stage 2
+# and one copy of each.
+#
+#   LEARNER     "torch"    -- stage 1 MLP, stage 2 sklearn boosting (default)
+#               "hgb"      -- both stages sklearn boosting, Poisson in stage 1
+#               "catboost" -- both stages CatBoost, Poisson in stage 1
+#   ENSEMBLE_K  copies per model. Above one, each copy is fitted on a bootstrap
+#               resample under its own seed and their predictions averaged.
+#
+# THE ENSEMBLE NEVER CROSSES THE SEAM. Stage 1 copies are averaged with stage 1
+# copies and stage 2 with stage 2. Averaging across the stages would put the
+# market price into the arm that is meant to be blind to it, and the shrinkage
+# would then be correcting a copy of the market. The auxiliary heads -- the
+# uncertainty head, the stake model, the reaction model -- are left as they
+# were; they are diagnostics, not the estimate being corrected.
+LEARNERS = ("torch", "hgb", "catboost")
+LEARNER = "torch"
+ENSEMBLE_K = 1
+
+CATBOOST_PARAMS = dict(iterations=300, learning_rate=0.03, depth=4,
+                       l2_leaf_reg=5.0, verbose=0, thread_count=1,
+                       allow_writing_files=False)
+
+
+def configure(learner: str = None, ensemble_k: int = None) -> None:
+    """Choose the learner and the ensemble size for every later fit."""
+    global LEARNER, ENSEMBLE_K
+    if learner is not None:
+        if learner not in LEARNERS:
+            raise ValueError(f"unknown learner {learner!r}; use one of {LEARNERS}")
+        LEARNER = learner
+    if ensemble_k is not None:
+        if ensemble_k < 1:
+            raise ValueError("ensemble_k must be at least 1")
+        ENSEMBLE_K = int(ensemble_k)
 
 
 # =========================================================================
@@ -409,6 +447,15 @@ def add_league_context(df: pd.DataFrame) -> pd.DataFrame:
         lambda x: x.shift(1).rolling(20, min_periods=5).mean()))
     out["league_home_rate_20"] = (home_win.groupby(out["Div"]).transform(
         lambda x: x.shift(1).rolling(20, min_periods=5).mean()))
+    # SAME-DAY MATCHES MUST NOT SEE EACH OTHER. Shifting by one row only keeps
+    # a match from seeing itself; a match later in the same day's sort order
+    # would still see the result of one kicking off alongside it. Every match
+    # on a date takes the value of that date's first row, which saw only
+    # earlier days.
+    for col in ("league_goals_20", "league_home_rate_20"):
+        # iloc[0], not "first": "first" skips nulls, and would hand an early
+        # match with no value the value of a later one.
+        out[col] = out.groupby(["Div", "Date"])[col].transform(lambda x: x.iloc[0])
     if "Tier" not in out.columns:
         out["Tier"] = out["Div"].map(lambda d: TIERS.get(d, ("?", 0))[1])
 
@@ -517,7 +564,13 @@ def load_and_prepare(export_csv: str = "all-euro-data-2025-2026.csv",
     print(f"Loaded {len(df):,} matches, {df['Div'].nunique()} divisions, "
           f"{df['Date'].min().date()} to {df['Date'].max().date()}")
 
-    return add_shot_features(add_market_features(calculate_rolling_features(df)))
+    # THE SAME FEATURE BUILD AS load_multiseason(). This used to stop at the
+    # shot features, so an export run trained stage 1 on 26 of the 66
+    # STAGE1_FEATURES -- no Elo, no previous season, no xG proxy, no league
+    # context -- and said nothing, because the only warning about missing
+    # blocks lives in attach_external_features(), which never ran.
+    built = add_shot_features(add_market_features(calculate_rolling_features(df)))
+    return attach_external_features(add_league_context(built))
 
 
 def load_multiseason(path: str = "matches_all.csv",
@@ -848,9 +901,114 @@ def make_classifier(seed: int = 42):
     comparison uses identical settings, and differences come from the pipeline
     rather than from quiet retuning.
     """
+    if ENSEMBLE_K > 1:
+        return BaggedClassifier(learner=LEARNER, k=ENSEMBLE_K, seed=seed)
+    return base_classifier(LEARNER, seed)
+
+
+def base_classifier(learner: str, seed: int):
+    """One stage 2 classifier. Only CatBoost replaces sklearn's boosting here."""
+    if learner == "catboost":
+        from catboost import CatBoostClassifier
+        return CatBoostClassifier(loss_function="MultiClass", random_seed=seed,
+                                  **{**CATBOOST_PARAMS, "depth": 3})
     return HistGradientBoostingClassifier(
         max_iter=100, learning_rate=0.01, max_leaf_nodes=15,
         max_depth=3, random_state=seed)
+
+
+def base_count_regressor(learner: str, seed: int):
+    """One stage 1 regressor for goals and shots, always with a Poisson loss."""
+    if learner == "catboost":
+        from catboost import CatBoostRegressor
+        return CatBoostRegressor(loss_function="Poisson", random_seed=seed,
+                                 **CATBOOST_PARAMS)
+    if learner == "hgb":
+        return HistGradientBoostingRegressor(
+            loss="poisson", max_iter=200, learning_rate=0.05,
+            max_leaf_nodes=15, max_depth=4, random_state=seed)
+    return TorchCountRegressor(seed)
+
+
+class _Bagged(BaseEstimator):
+    """
+    K copies of one model, each on its own subsample and seed.
+
+    WHY RESAMPLE AND NOT JUST RESEED. sklearn's boosting without subsampling is
+    deterministic on windows this size -- early stopping is off below 10,000
+    rows, so random_state changes nothing. K reseeded copies would be K
+    identical models. Resampling rows gives every learner something real to
+    disagree about.
+
+    WITHOUT REPLACEMENT, NOT A BOOTSTRAP. A bootstrap repeats rows, and the MLP
+    carves its early-stopping set out of whatever it is given: copies of the
+    same match then sat on both sides of that split, early stopping watched a
+    score it had trained on, and the ensemble came out worse than one copy.
+    Each copy takes a random SUBSAMPLE share of the rows instead, each row once.
+
+    It is one estimator to the outside, so cross_val_predict clones and fits the
+    whole ensemble inside each fold. The out-of-fold predictions that w, rho and
+    tau are fitted on therefore come from the ensemble too, not from a single
+    copy standing in for it.
+    """
+
+    def __init__(self, learner: str = "torch", k: int = 5, seed: int = 42,
+                 subsample: float = 0.8):
+        self.learner = learner
+        self.k = k
+        self.seed = seed
+        self.subsample = subsample
+
+    def _new(self, seed):                                   # pragma: no cover
+        raise NotImplementedError
+
+    def fit(self, X, y):
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y)
+        rng = np.random.default_rng(self.seed)
+        self.members_ = []
+        n = max(int(round(len(X) * self.subsample)), 1)
+        for i in range(self.k):
+            idx = np.sort(rng.choice(len(X), size=n, replace=False))
+            self.members_.append(self._new(self.seed + 1000 * (i + 1))
+                                 .fit(X[idx], y[idx]))
+        return self
+
+
+class BaggedCountRegressor(RegressorMixin, _Bagged):
+    """Stage 1: the average of K Poisson rates."""
+
+    def _new(self, seed):
+        return base_count_regressor(self.learner, seed)
+
+    def predict(self, X):
+        X = np.asarray(X, dtype=float)
+        rate = np.mean([m.predict(X) for m in self.members_], axis=0)
+        return np.clip(rate, 1e-4, 25.0)
+
+
+class BaggedClassifier(ClassifierMixin, _Bagged):
+    """Stage 2: the average of K probability vectors."""
+
+    def _new(self, seed):
+        return base_classifier(self.learner, seed)
+
+    def fit(self, X, y):
+        self.classes_ = np.unique(y)
+        return super().fit(X, y)
+
+    def predict_proba(self, X):
+        X = np.asarray(X, dtype=float)
+        out = np.zeros((len(X), len(self.classes_)))
+        for m in self.members_:
+            # A resample can miss a class; line each copy's columns up by label.
+            cols = np.searchsorted(self.classes_, np.asarray(m.classes_).ravel())
+            out[:, cols] += m.predict_proba(X)
+        out /= len(self.members_)
+        return out / out.sum(axis=1, keepdims=True)
+
+    def predict(self, X):
+        return self.classes_[self.predict_proba(X).argmax(axis=1)]
 
 
 class TorchCountRegressor(BaseEstimator, RegressorMixin):
@@ -966,7 +1124,9 @@ def make_regressor(seed: int = 42, count: bool = False):
     the grid requires and squared error does not guarantee.
     """
     if count:                      # the physical targets -- this is the swap
-        return TorchCountRegressor(seed)
+        if ENSEMBLE_K > 1:
+            return BaggedCountRegressor(learner=LEARNER, k=ENSEMBLE_K, seed=seed)
+        return base_count_regressor(LEARNER, seed)
     return HistGradientBoostingRegressor(
         max_iter=200, learning_rate=0.05, max_leaf_nodes=15,
         max_depth=4, random_state=seed)
@@ -2464,7 +2624,8 @@ def check_non_vacuousness(preds_df: pd.DataFrame,
                           corrected_prefix: str = "p_corr",
                           raw_prefix: str = "p_indep",
                           taus: np.ndarray = None,
-                          n_boot: int = 1000) -> pd.DataFrame:
+                          n_boot: int = 1000,
+                          criterion: str = None) -> pd.DataFrame:
     """
     Test whether the correction is real or just a relabelled threshold.
 
@@ -2483,13 +2644,20 @@ def check_non_vacuousness(preds_df: pd.DataFrame,
     well below one means the correction REORDERS which matches look attractive,
     and no change of threshold can do that.
     """
+    # ON THE SAME CRITERION AS THE CLAIM. This used to rank by expected value
+    # while the operating point and the headline rank by edge, so the gate was
+    # testing a different selection rule from the one being reported.
+    criterion = criterion or OP_CRITERION
+    if not rankable(preds_df, corrected_prefix, criterion):
+        return pd.DataFrame()          # collapsed onto the market: nothing to test
     if taus is None:
-        taus = np.quantile(score_pool(preds_df, corrected_prefix),
+        taus = np.quantile(score_pool(preds_df, corrected_prefix,
+                                      criterion=criterion),
                            np.linspace(0.60, 0.99, 12))
 
     rows = []
     for tau in taus:
-        bets_c = select_bets(preds_df, tau, corrected_prefix)
+        bets_c = select_bets(preds_df, tau, corrected_prefix, criterion=criterion)
         n_target = len(bets_c)
         if n_target < 20:
             continue
@@ -2499,12 +2667,13 @@ def check_non_vacuousness(preds_df: pd.DataFrame,
         lo, hi = -1.0, 5.0
         for _ in range(40):
             mid = (lo + hi) / 2
-            if len(select_bets(preds_df, mid, raw_prefix)) > n_target:
+            if len(select_bets(preds_df, mid, raw_prefix,
+                               criterion=criterion)) > n_target:
                 lo = mid
             else:
                 hi = mid
         tau_prime = (lo + hi) / 2
-        bets_r = select_bets(preds_df, tau_prime, raw_prefix)
+        bets_r = select_bets(preds_df, tau_prime, raw_prefix, criterion=criterion)
 
         id_c = set(zip(bets_c["match_key"], bets_c["Selection"]))
         id_r = set(zip(bets_r["match_key"], bets_r["Selection"]))
@@ -2542,6 +2711,15 @@ def era_breakdown(preds_df: pd.DataFrame, folds_df: pd.DataFrame,
         unit_col = "Block" if "Block" in preds_df.columns else "Season"
 
     criterion = criterion or OP_CRITERION
+    # An arm collapsed onto the market has no edge to rank, and its "top 10%"
+    # is a sort of rounding residue. Same rule as the operating point.
+    if not rankable(preds_df, prob_prefix, criterion):
+        return pd.DataFrame()
+    # Where the fold diagnostics carry a threshold read off VALIDATION for this
+    # arm, use it, so a test unit's own scores never choose its bets.
+    tau_col = {"p_corr": "op_tau", "p_indep": "op_tau_indep"}.get(prob_prefix)
+    if criterion != OP_CRITERION or tau_col not in folds_df.columns:
+        tau_col = None
     rows = []
     for unit, part in preds_df.groupby(preds_df[unit_col]):
         # BY COVERAGE, AND ON THE SAME CRITERION AS EVERYTHING ELSE. This was
@@ -2549,8 +2727,11 @@ def era_breakdown(preds_df: pd.DataFrame, folds_df: pd.DataFrame,
         # units: under edge ranking it selected nothing useful, and when the
         # weight collapses to zero it scored the market's own picks -- so two
         # different models printed byte-identical rows here.
-        tau = float(np.quantile(score_pool(part, prob_prefix, criterion=criterion),
-                                1.0 - coverage))
+        fold_tau = (folds_df.loc[folds_df["test_unit"] == unit, tau_col]
+                    if tau_col else pd.Series(dtype=float))
+        tau = (float(fold_tau.iloc[0]) if len(fold_tau) else
+               float(np.quantile(score_pool(part, prob_prefix, criterion=criterion),
+                                 1.0 - coverage)))
         bets = select_bets(part, tau, prob_prefix, criterion=criterion)
         b = bootstrap_roi(bets, n_boot=2000)
         w = folds_df.loc[folds_df["test_unit"] == unit, "w"]
@@ -2723,6 +2904,12 @@ def fit_fold(fold, seed: int = 42, stage2_target: str = "probability",
     va_scored = window.copy()
     va_scored[outcome_cols("p_corr")] = apply_static_shrinkage(
         fit_ref, fit_model, w)
+    # The uncorrected arm gets a threshold of its own. If the weight collapses,
+    # the corrected arm cannot rank anything and the report falls back to this
+    # one -- a threshold read off the corrected arm would then be a quantile of
+    # rounding error, and applying it to real edges would select almost
+    # everything.
+    va_scored[outcome_cols("p_indep")] = fit_model
 
     # The operating point's threshold is read off VALIDATION scores, so the test
     # unit's own score distribution never decides which of its bets are placed.
@@ -2733,6 +2920,9 @@ def fit_fold(fold, seed: int = 42, stage2_target: str = "probability",
     # that. Both thresholds are reported; this is the one the claim rests on.
     op_tau = float(np.quantile(
         score_pool(va_scored, "p_corr", criterion=OP_CRITERION),
+        1.0 - op_coverage))
+    op_tau_indep = float(np.quantile(
+        score_pool(va_scored, "p_indep", criterion=OP_CRITERION),
         1.0 - op_coverage))
 
     stake_model = None
@@ -2761,7 +2951,8 @@ def fit_fold(fold, seed: int = 42, stage2_target: str = "probability",
     diagnostics = {
         "test_unit": fold.test_unit, "val_unit": fold.val_unit,
         "n_train": len(tr), "n_val": len(va), "n_test": len(te),
-        "w": w, "w_band": w_band, "c_js": c_js,
+        "learner": LEARNER, "ensemble_k": ENSEMBLE_K,
+        "w": w, "w_band": w_band, "c_js": c_js, "op_tau_indep": op_tau_indep,
         "rho": engine.rho, "n_rho_div": len(engine.rho_by_div), "op_tau": op_tau,
         "uncertainty_corr": corr, "uncertainty_corr_in": corr_in,
         **{f"ll_{name}": log_loss(y_test, p, labels=[0, 1, 2])
@@ -2879,6 +3070,7 @@ def main(source: str = "raw/all-euro-data-2025-2026.csv", mode: str = "export",
     print(f"  Dixon-Coles    : {'on' if use_dixon_coles else 'off'}")
     print(f"  fitted w(x)    : {'on' if learn_w else 'off'}")
     print(f"  learned stakes : {'on' if learn_stakes else 'off'}")
+    print(f"  learner        : {LEARNER}, ensemble of {ENSEMBLE_K}")
     print("=" * 70)
 
     df = load_and_prepare(source) if mode == "export" else load_multiseason(source)
@@ -2955,12 +3147,30 @@ def main(source: str = "raw/all-euro-data-2025-2026.csv", mode: str = "export",
     # Each test unit is thresholded at the tau its own validation unit gave,
     # so no test score helps decide which test bets are placed.
     unit_col = "Block" if "Block" in preds.columns else "Season"
+
+    # WHICH ARM THE OPERATING POINT RUNS ON. When the weight collapses to zero
+    # the corrected arm IS the market, its edge is zero on every match, and the
+    # only thing left to rank is floating-point residue from renormalising the
+    # blend -- around 2e-07. Sorting that and taking the top 10% picks matches
+    # at random while looking exactly like a strategy, and the resulting ROI
+    # reads as a result. It is not one. So the operating point runs on the
+    # corrected arm only while that arm still differs from the market, and
+    # falls back to the uncorrected one, which always has opinions of its own.
+    op_prefix = "p_corr" if rankable(preds, "p_corr", OP_CRITERION) else "p_indep"
+    if op_prefix != "p_corr":
+        print("\n  NOTE: the corrected arm has collapsed onto the market, so it "
+              "cannot\n  rank anything -- its edge is zero on every match. The "
+              "operating point\n  below is the UNCORRECTED arm, which still "
+              "selects on its own opinion.")
+
+    tau_col = "op_tau" if op_prefix == "p_corr" else "op_tau_indep"
     op_bets = pd.concat(
-        [select_bets(preds[preds[unit_col] == unit], tau, "p_corr",
+        [select_bets(preds[preds[unit_col] == unit], tau, op_prefix,
                      criterion=OP_CRITERION)
-         for unit, tau in zip(folds["test_unit"], folds["op_tau"])],
+         for unit, tau in zip(folds["test_unit"], folds[tau_col])],
         ignore_index=True)
-    report_roi(op_bets, f"Operating point: corrected, top 10% by "
+    op_label = "corrected" if op_prefix == "p_corr" else "uncorrected"
+    report_roi(op_bets, f"Operating point: {op_label}, top 10% by "
                         f"{OP_CRITERION.upper()} on the training window "
                         f"(per-fold tau in the diagnostics)")
 
@@ -2991,14 +3201,20 @@ def main(source: str = "raw/all-euro-data-2025-2026.csv", mode: str = "export",
             show(f"Risk-coverage by {criterion}, {label}:  "
                  f"AURC = {aurc(curve):+.3f}", curve)
 
-    nv = show("Non-vacuousness check:",
-              check_non_vacuousness(preds, "p_corr", "p_indep"))
+    nv = check_non_vacuousness(preds, "p_corr", "p_indep")
+    if len(nv):
+        show(f"Non-vacuousness check (ranked by {OP_CRITERION}):", nv)
+    else:
+        print(f"\nNon-vacuousness check: skipped. The corrected arm has no "
+              f"{OP_CRITERION} to rank on\n  -- it collapsed onto the market -- "
+              "so there is no corrected selection to compare.")
     if len(nv) and nv["overlap"].mean() > 0.95:
         print("\n  WARNING: the corrected and uncorrected rules are selecting "
               "almost the same bets.\n  The correction may be a relabelled "
               "threshold rather than a correction.")
 
-    show(f"By {unit_col.lower()}:", era_breakdown(preds, folds))
+    show(f"By {unit_col.lower()} ({op_label} arm, validation tau):",
+         era_breakdown(preds, folds, prob_prefix=op_prefix, unit_col=unit_col))
 
     if export:
         keep = ["match_key", "Date", "Season", "Div", "Tier", "target"]
@@ -3043,7 +3259,12 @@ if __name__ == "__main__":
     ap.add_argument("--no-learned-stakes", action="store_true")
     ap.add_argument("--export", default=None,
                     help="write per-match predictions to this CSV")
+    ap.add_argument("--learner", default="torch", choices=list(LEARNERS),
+                    help="stage 1 and stage 2 learner (default: the MLP)")
+    ap.add_argument("--ensemble-k", type=int, default=1,
+                    help="bagged copies per stage, averaged within the stage")
     args = ap.parse_args()
+    configure(learner=args.learner, ensemble_k=args.ensemble_k)
 
     defaults = {"export": "raw/all-euro-data-2025-2026.csv",
                 "multiseason": "matches_all.csv"}
