@@ -187,8 +187,8 @@ print()
 if 'Referee' in df.columns and 'HF' in df.columns:
     df['total_fouls'] = df['HF'].fillna(0) + df['AF'].fillna(0)
     df['total_cards'] = (df['HY'].fillna(0) + df['AY'].fillna(0)) + 2 * (df['HR'].fillna(0) + df['AR'].fillna(0))
-    df['ref_fouls_mean'] = df.groupby('Referee')['total_fouls'].transform(lambda x: x.expanding().mean()).fillna(25.0)
-    df['ref_cards_mean'] = df.groupby('Referee')['total_cards'].transform(lambda x: x.expanding().mean()).fillna(4.0)
+    df['ref_fouls_mean'] = df.groupby('Referee')['total_fouls'].transform(lambda x: x.shift(1).expanding().mean()).fillna(25.0)
+    df['ref_cards_mean'] = df.groupby('Referee')['total_cards'].transform(lambda x: x.shift(1).expanding().mean()).fillna(4.0)
 else:
     df['ref_fouls_mean'] = 25.0
     df['ref_cards_mean'] = 4.0
