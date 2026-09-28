@@ -871,6 +871,61 @@ if all_fold_bets:
         wr_s = grp['target_win'].mean() * 100
         flat_s = ((grp['target_win'] * (grp['odds'] - 1.0) - (1 - grp['target_win'])).sum()) / n_s * 100
         print(f"  Season {season}: n={n_s} WinRate={wr_s:.1f}% FlatROI={flat_s:+.2f}%")
+
+    # ============================================================
+    # CHANGE #11: bet-level "confidence score" diagnostics for the placed
+    # bets of the production ensemble. Read-only: nothing here feeds back
+    # into model training or bet selection.
+    #  (a) saves every placed bet with its stage2_p_win (the confidence score)
+    #  (b) compares stated confidence with realized win rate (calibration)
+    #  (c) compares the model's own expected ROI with realized ROI
+    #  (d) bootstrap CI that resamples INDIVIDUAL BETS (the season-level
+    #      bootstrap above only reshuffles 3 seasons, so it looks tighter)
+    # ============================================================
+    print("\n" + "=" * 80)
+    print("BET-LEVEL CONFIDENCE DIAGNOSTICS (production ensemble, placed bets only)")
+    print("=" * 80)
+    profit = pooled['target_win'] * (pooled['odds'] - 1.0) - (1 - pooled['target_win'])
+    pooled = pooled.assign(_profit=profit)
+    keep = [c for c in ['season', 'date', 'home_team', 'away_team', 'bet_type', 'odds',
+                        'stage2_p_win', 'stage2_ev', 'target_win', 'clv'] if c in pooled.columns]
+    pooled[keep].to_csv("placed_bets_production.csv", index=False)
+    print(f"Saved {len(pooled)} placed bets to placed_bets_production.csv")
+
+    print(f"\n(b) Stated confidence vs realized win rate")
+    print(f"  Mean stated confidence (stage2_p_win): {pooled['stage2_p_win'].mean()*100:.1f}%")
+    print(f"  Realized win rate:                     {pooled['target_win'].mean()*100:.1f}%")
+    print(f"  Gap (realized - stated):               {(pooled['target_win'].mean()-pooled['stage2_p_win'].mean())*100:+.1f} pts")
+    print("  By confidence bin:")
+    bins = [0.58, 0.62, 0.66, 0.70, 1.01]
+    labels = ["0.58-0.62", "0.62-0.66", "0.66-0.70", "0.70+"]
+    pooled['_bin'] = pd.cut(pooled['stage2_p_win'], bins=bins, labels=labels, right=False)
+    for lab in labels:
+        g = pooled[pooled['_bin'] == lab]
+        if len(g) == 0:
+            print(f"    {lab}: n=0")
+            continue
+        print(f"    {lab}: n={len(g):3d}  stated={g['stage2_p_win'].mean()*100:5.1f}%  "
+              f"realized={g['target_win'].mean()*100:5.1f}%  avg_odds={g['odds'].mean():.2f}  "
+              f"FlatROI={g['_profit'].mean()*100:+.1f}%")
+    print("  (bins with small n are noisy -- read the overall gap first)")
+
+    print(f"\n(c) Model's own expectation vs reality")
+    print(f"  Mean stage2_ev (model's expected ROI per bet): {pooled['stage2_ev'].mean()*100:+.2f}%")
+    print(f"  Realized flat ROI:                             {pooled['_profit'].mean()*100:+.2f}%")
+
+    print(f"\n(d) Bet-level bootstrap on pooled Flat ROI ({N_BOOTSTRAP} resamples of individual bets)")
+    rng_b = np.random.default_rng(42)
+    prof = pooled['_profit'].values
+    boots = np.array([prof[rng_b.integers(0, len(prof), len(prof))].mean() * 100 for _ in range(N_BOOTSTRAP)])
+    lo_b, hi_b = np.percentile(boots, [2.5, 97.5])
+    se_b = prof.std(ddof=1) / np.sqrt(len(prof)) * 100
+    print(f"  Flat ROI point estimate: {prof.mean()*100:+.2f}%   (n={len(prof)})")
+    print(f"  Bootstrap 95% CI:        [{lo_b:+.2f}%, {hi_b:+.2f}%]")
+    print(f"  Standard error:          {se_b:.2f} pts")
+    print(f"  P(true ROI <= 0):        {(boots <= 0).mean():.3f}")
+    print("  Caveat: bets in the same season are correlated, so even this interval is optimistic;")
+    print("  it is still much wider than the 3-season bootstrap because it uses every bet.")
 print("=" * 80)
 
 # ============================================================
